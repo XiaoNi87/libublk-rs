@@ -2500,6 +2500,14 @@ impl UblkCtrl {
         }
     }
 
+    /// Issue a single takeover attempt without retrying EBUSY for 30 seconds.
+    /// A negative CQE is returned as a negative value, matching control APIs.
+    /// Callers must check the value as well as the outer transport Result.
+    #[cfg(feature = "raid5-bpf")]
+    pub fn try_start_user_recover(&self) -> Result<i32, UblkError> {
+        self.get_inner_mut().__start_user_recover()
+    }
+
     /// Start user recover for this device
     ///
     pub fn start_user_recover(&self) -> Result<i32, UblkError> {
@@ -2546,6 +2554,61 @@ impl UblkCtrl {
             ctrl.end_user_recover(unsafe { libc::getpid() as i32 })
         } else {
             Err(crate::UblkError::OtherError(-libc::EINVAL))
+        }
+    }
+
+    /// Start while observing worker failure, without abandoning a live control
+    /// command. On cancellation, consume BOTH the AsyncCancel and original
+    /// START CQEs before releasing the control state or allowing STOP.
+    /// Intended for targets whose initial FETCH can fail before driver readiness.
+    pub fn start_dev_cancellable(
+        &self,
+        dev: &UblkDev,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<i32, UblkError> {
+        let mut ctrl = self.get_inner_mut();
+        ctrl.prep_start_dev(dev)?;
+        dev.wait_for_buffer_registration(ctrl.dev_info.nr_hw_queues as usize)?;
+        let pid = unsafe { libc::getpid() };
+        let data = if ctrl.dev_info.state != sys::UBLK_S_DEV_QUIESCED as u16 {
+            UblkCtrlInner::prepare_start_cmd(pid)
+        } else if ctrl.for_recover_dev() {
+            UblkCtrlInner::prepare_end_user_recover_cmd(pid)
+        } else {
+            return Err(UblkError::OtherError(-libc::EINVAL));
+        };
+        if cancelled() {
+            return Err(UblkError::OtherError(-libc::ECANCELED));
+        }
+        let token = ctrl.ublk_submit_cmd(&data, 0)?;
+        let cancel_token = token | (1_u64 << 63);
+        let mut cancel_sent = false;
+        let mut cancel_done = false;
+        let mut result = None;
+        loop {
+            with_ctrl_ring_mut_internal!(|ring: &mut IoUring<squeue::Entry128>| {
+                for cqe in ring.completion() {
+                    if cqe.user_data() == token {
+                        result = Some(cqe.result());
+                    } else if cqe.user_data() == cancel_token {
+                        cancel_done = true;
+                    }
+                }
+            });
+            if result.is_some() && (!cancel_sent || cancel_done) {
+                return UblkCtrlInner::ublk_err_to_result(result.unwrap());
+            }
+            if !cancel_sent && result.is_none() && cancelled() {
+                let sqe: squeue::Entry128 = opcode::AsyncCancel::new(token)
+                    .build().user_data(cancel_token).into();
+                with_ctrl_ring_mut_internal!(|ring: &mut IoUring<squeue::Entry128>| {
+                    // Only START is outstanding; this control ring has room.
+                    unsafe { ring.submission().push(&sqe).expect("control cancel SQ space") };
+                    let _ = ring.submit();
+                });
+                cancel_sent = true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
         }
     }
 
