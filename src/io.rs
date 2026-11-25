@@ -377,6 +377,37 @@ where
     QUEUE_RING.with(|cell| init_fn(cell))
 }
 
+/// Initialize a custom-kernel BPF ring before queue construction.
+/// Identical repeated calls succeed; incompatible existing rings are rejected.
+#[cfg(feature = "raid5-bpf")]
+pub fn ublk_init_bpf_task_ring(sq_depth: u32, cq_depth: u32) -> Result<(), UblkError> {
+    thread_local! {
+        static CONFIG: std::cell::Cell<Option<(u32, u32)>> = const { std::cell::Cell::new(None) };
+    }
+    if sq_depth == 0 || cq_depth < sq_depth {
+        return Err(UblkError::OtherError(-libc::EINVAL));
+    }
+    CONFIG.with(|config| ublk_init_task_ring(|cell| {
+        if cell.get().is_some() {
+            return if config.get() == Some((sq_depth, cq_depth)) {
+                Ok(())
+            } else {
+                Err(UblkError::OtherError(-libc::EEXIST))
+            };
+        }
+        let ring = IoUring::<squeue::Entry, cqueue::Entry>::builder()
+            .setup_cqsize(cq_depth)
+            .setup_coop_taskrun()
+            .setup_bpf_ext()
+            .build(sq_depth)
+            .map_err(UblkError::IOError)?;
+        cell.set(RefCell::new(ring))
+            .map_err(|_| UblkError::OtherError(-libc::EEXIST))?;
+        config.set(Some((sq_depth, cq_depth)));
+        Ok(())
+    }))
+}
+
 /// Internal function to initialize the queue ring with default parameters
 pub(crate) fn init_task_ring_default(sq_depth: u32, cq_depth: u32) -> Result<(), UblkError> {
     ublk_init_task_ring(|cell| {
@@ -1981,6 +2012,48 @@ impl UblkQueue<'_> {
                 self.mark_stopping();
                 Err(e)
             }
+        }
+    }
+
+    /// Terminal error completion after a rejected delivery command or target
+    /// failure. Never invokes target data I/O. Bypass the normal stopping guard
+    /// so an already-owned client request is not stranded during STOP.
+    /// Drain the original COMMIT and its narrowly matched cancellation CQE.
+    pub async fn fail_io_cmd(&self, tag: u16, descriptor: BufDesc<'_>) -> Result<(), UblkError> {
+        let BufDesc::AutoReg(reg) = descriptor else {
+            return Err(UblkError::OtherError(-libc::EINVAL));
+        };
+        loop {
+            let future = UblkUringOpFuture::new(0);
+            let user_data = future.user_data | tag as u64;
+            with_queue_ring_mut_internal!(|ring: &mut IoUring<squeue::Entry>| {
+                self.__queue_io_cmd_no_state(ring, tag, sys::UBLK_U_IO_COMMIT_AND_FETCH_REQ,
+                    0, Some(bindings::ublk_auto_buf_reg_to_sqe_addr(&reg)), user_data, -libc::EIO);
+                self.state.borrow_mut().inc_cmd_inflight();
+                // Run command task-work in its owning task before requesting
+                // cancellation. Cancelling in the same submission batch can
+                // cancel COMMIT before the driver consumes the error result.
+                let ts = types::Timespec::new().nsec(1_000_000);
+                let args = types::SubmitArgs::new().timespec(&ts);
+                let _ = ring.submitter().submit_with_args(1, &args);
+            });
+            let cancel = crate::uring_async::__ublk_submit_sqe_async(
+                opcode::AsyncCancel::new(user_data).build(), UblkUringData::Target as u64)?;
+            let cancellation = cancel.await;
+            let result = future.await;
+            if cancellation < 0 && cancellation != -libc::ENOENT {
+                return Err(UblkError::OtherError(cancellation));
+            }
+            if result == 0 {
+                // A fresh request raced shutdown. Complete ONLY its EIO result;
+                // never hand it to the target data path while stopping.
+                continue;
+            }
+            return if result == sys::UBLK_IO_RES_ABORT || result == -libc::EBUSY {
+                Ok(())
+            } else {
+                Err(UblkError::OtherError(result))
+            };
         }
     }
 

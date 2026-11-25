@@ -17,6 +17,7 @@ publish = true
 maintenance = { status = "actively-developed" }
 
 [features]
+raid5-bpf = ["io-uring/raid5-bpf"]
 fat_complete = []
 
 [[bin]]
@@ -48,7 +49,7 @@ scripts = ["utils/ublk_chown.sh"]
 # 2. THEN, define ALL conditional [target.'cfg(...)'.dependencies] blocks.
 
 [dependencies]
-libublk-rs-sys = { path = "libublk-rs-sys", version = "0.1.1" }
+libublk-rs-sys = { version = "0.1.1" }
 
 libc = "0.2"
 serde = {version = "1.0.99", features = ["derive"]}
